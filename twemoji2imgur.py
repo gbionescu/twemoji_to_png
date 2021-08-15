@@ -1,93 +1,66 @@
 #!/usr/bin/env python3
-import json
+import asyncio
 import os
-import subprocess
-from imgurpython import ImgurClient
 
-SVG_PATH = "twemoji/svg/"
-DENSITY = None
+SVG_PATH = "twemoji/assets/svg/"
 
-def do_init():
-    global DENSITY
+futures = []
+lock = asyncio.Lock()
 
-    auth = json.load(open("config.json"))
+async def _run(cmd):
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
 
-    # Read client ID and secret
-    client_id = auth["client_id"]
-    client_secret = auth["client_secret"]
+    stdout, stderr = await proc.communicate()
 
-    # Also read the imagemagick density
-    DENSITY = auth["density"]
+    print(f'[{cmd!r} exited with {proc.returncode}]')
+    if stdout:
+        print(f'[stdout]\n{stdout.decode()}')
+    if stderr:
+        print(f'[stderr]\n{stderr.decode()}')
+        
+    if proc.returncode != 0:
+        raise ValueError("Error running " + cmd)
 
-    # Check if there are access and refresh tokens
-    access_token = None
-    refresh_token = None
-    if "access_token" in auth:
-        access_token = auth["access_token"]
+async def run(cmd):
+    async with lock:
+        global futures 
+        futures.append(_run(cmd))
+        
+        if len(futures) > 32:
+            await asyncio.gather(*futures)
+            futures = []
 
-    if "refresh_token" in auth:
-        refresh_token = auth["refresh_token"]
-
-    if access_token and refresh_token:
-        # If access and refresh tokens are available, just log in
-        client = ImgurClient(client_id, client_secret, access_token, refresh_token)
-    else:
-        # Otherwise go through the authentication process
-        client = ImgurClient(client_id, client_secret)
-
-        # Get auth URL
-        print("Go to: %s" % client.get_auth_url('pin'))
-        print("Enter pin code: ")
-        pin = input()
-
-        credentials = client.authorize(pin, 'pin')
-        client.set_user_auth(credentials['access_token'], credentials['refresh_token'])
-
-        print("Access token:  {0}".format(credentials['access_token']))
-        print("Refresh token: {0}".format(credentials['refresh_token']))
-
-        # Save the config back
-        auth = json.load(open("config.json"))
-        auth["access_token"] = credentials['access_token']
-        auth["refresh_token"] = credentials['refresh_token']
-
-        auth_cfg = open("config.json", "w")
-        auth_cfg.write(json.dumps(auth, indent=4))
-
-    return client
-
-def do_upload(client):
-    # Try loading the output json
-    try:
-        svg_urls = json.load(open("out.json"))
-    except:
-        svg_urls = {}
+async def do_work(density, source, destination):
     # Create a folder where PNGs are stored
-    os.makedirs("png", exist_ok=True)
+    os.makedirs(destination, exist_ok=True)
+    
+    # Collect existing PNGs
+    already_done = [svg.split(".")[0] for svg in os.listdir(destination)]
 
     # Go through each SVG
-    for svg in os.listdir(SVG_PATH):
+    for svg in os.listdir(source):
         svg_name = svg.replace(".svg", "")
 
         # If already processed, skip it
-        if svg_name in svg_urls:
+        if svg_name in already_done:
+            print("Skipping %s" % svg_name)
             continue
 
         print("Processing %s" % svg)
 
         # Convert it from SVG to PNG
-        png = "png/%s.png" % svg_name
-        subprocess.run(["convert -density %s -background none %s %s" % (DENSITY, SVG_PATH + svg, png)], shell=True)
+        png = destination + "/%s.png" % svg_name
+        await run("convert -density %s -background none %s %s" % (density, source + svg, png))
 
-        # Upload it
-        upload_json = client.upload_from_path(png)
-
-        # Save the link
-        svg_urls[svg_name] = upload_json["link"]
-
-        # Save the JSON back
-        out = open("out.json", "w")
-        out.write(json.dumps(svg_urls, indent=4))
-
-if __name__ == "__main__":
-    do_upload(do_init())
+async def convert_all():
+    await asyncio.gather(*[
+        do_work(800, SVG_PATH, f"results/800/"),
+        do_work(2000, SVG_PATH, f"results/2000/")])
+        
+    await asyncio.gather(*futures)
+        
+loop = asyncio.get_event_loop()
+loop.run_until_complete(convert_all())
